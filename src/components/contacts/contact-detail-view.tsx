@@ -5,7 +5,7 @@ import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
 import { formatCurrency } from '@/lib/currency';
 import { toast } from 'sonner';
-import type { Contact, Tag, ContactTag, ContactNote, CustomField, ContactCustomValue, Deal, MessageTemplate } from '@/types';
+import type { Contact, Tag, ContactTag, ContactNote, CustomField, ContactCustomValue, Deal, MessageTemplate, Company } from '@/types';
 import {
   TemplatePicker,
   type TemplateSendValues,
@@ -25,6 +25,13 @@ import { Textarea } from '@/components/ui/textarea';
 import { Avatar, AvatarFallback } from '@/components/ui/avatar';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import {
   Phone,
   Mail,
@@ -73,6 +80,8 @@ export function ContactDetailView({
   const [editPhone, setEditPhone] = useState('');
   const [editEmail, setEditEmail] = useState('');
   const [editCompany, setEditCompany] = useState('');
+  const [editCompanyId, setEditCompanyId] = useState<string | null>(null);
+  const [companies, setCompanies] = useState<Company[]>([]);
   const [savingDetails, setSavingDetails] = useState(false);
 
   // Tags tab
@@ -112,9 +121,15 @@ export function ContactDetailView({
       setEditPhone(data.phone);
       setEditEmail(data.email ?? '');
       setEditCompany(data.company ?? '');
+      setEditCompanyId(data.company_id ?? null);
     }
     setLoading(false);
   }, [contactId, supabase]);
+
+  const fetchCompanies = useCallback(async () => {
+    const { data } = await supabase.from('companies').select('*').order('name');
+    if (data) setCompanies(data);
+  }, [supabase]);
 
   const fetchTags = useCallback(async () => {
     if (!contactId) return;
@@ -182,12 +197,13 @@ export function ContactDetailView({
   useEffect(() => {
     if (open && contactId) {
       fetchContact();
+      fetchCompanies();
       fetchTags();
       fetchNotes();
       fetchCustomFields();
       fetchDeals();
     }
-  }, [open, contactId, fetchContact, fetchTags, fetchNotes, fetchCustomFields, fetchDeals]);
+  }, [open, contactId, fetchContact, fetchCompanies, fetchTags, fetchNotes, fetchCustomFields, fetchDeals]);
 
   async function copyPhone() {
     if (!contact) return;
@@ -210,6 +226,7 @@ export function ContactDetailView({
         phone: editPhone.trim(),
         email: editEmail.trim() || null,
         company: editCompany.trim() || null,
+        company_id: editCompanyId,
         updated_at: new Date().toISOString(),
       })
       .eq('id', contactId);
@@ -429,10 +446,13 @@ export function ContactDetailView({
                         {contact.email}
                       </span>
                     )}
-                    {contact.company && (
+                    {(contact.company_id || contact.company) && (
                       <span className="flex items-center gap-1">
                         <Building2 className="size-3" />
-                        {contact.company}
+                        {contact.company_id
+                          ? (companies.find((c) => c.id === contact.company_id)?.name ??
+                            contact.company)
+                          : contact.company}
                       </span>
                     )}
                   </div>
@@ -527,6 +547,29 @@ export function ContactDetailView({
                       className="bg-muted border-border text-foreground h-8 text-sm"
                     />
                   </div>
+                  {companies.length > 0 && (
+                    <div className="space-y-1.5">
+                      <Label className="text-muted-foreground text-xs">
+                        {t('linkedCompanyLabel')}
+                      </Label>
+                      <Select
+                        value={editCompanyId ?? 'none'}
+                        onValueChange={(v) => setEditCompanyId(v === 'none' ? null : v)}
+                      >
+                        <SelectTrigger className="h-8 w-full text-sm">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">{t('linkedCompanyNone')}</SelectItem>
+                          {companies.map((c) => (
+                            <SelectItem key={c.id} value={c.id}>
+                              {c.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  )}
                   <Button
                     onClick={saveDetails}
                     disabled={savingDetails}

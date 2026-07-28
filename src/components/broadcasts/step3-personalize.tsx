@@ -207,7 +207,7 @@ export function Step3Personalize({
         if (mapping.type === 'static' && mapping.value) {
           replacement = mapping.value;
         } else if (mapping.type === 'field' && mapping.value) {
-          const fieldMap: Record<string, string | undefined> = {
+          const fieldMap: Record<string, string | null | undefined> = {
             name: contact.name,
             phone: contact.phone,
             email: contact.email,

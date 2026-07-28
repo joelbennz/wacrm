@@ -1,22 +1,13 @@
 'use client';
 
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
-import {
-  dedupeByPhone,
-  isUniqueViolation,
-  normalizeKey,
-} from '@/lib/contacts/dedupe';
 import {
   parseContactCsv,
   type ParsedContactRow,
 } from '@/lib/contacts/parse-contact-csv';
-import {
-  assignImportedContactTags,
-  resolveImportTagIds,
-  type ContactTagAssignment,
-} from '@/lib/contacts/resolve-import-tags';
+import type { Operation } from '@/types';
 import { cn } from '@/lib/utils';
 import { toast } from 'sonner';
 import {
@@ -35,12 +26,34 @@ import {
   CheckCircle,
   XCircle,
   AlertTriangle,
+  Network,
   Tag,
 } from 'lucide-react';
 import { useTranslations } from 'next-intl';
 
 const DEFAULT_TAG_COLOR = '#3b82f6';
 const PREVIEW_LIMIT = 5;
+const IMPORT_CHUNK_SIZE = 500;
+
+interface ImportSummary {
+  total: number;
+  processed: number;
+  created: number;
+  linkedExisting: number;
+  alreadyLinked: number;
+  invalid: number;
+  conflicts: number;
+  failed: number;
+  tagsAssigned: number;
+  partial: boolean;
+  issues: ImportIssue[];
+}
+
+interface ImportIssue {
+  row: number;
+  status: 'invalid' | 'conflict' | 'failed';
+  error: string;
+}
 
 function truncateFilename(name: string, max = 48): string {
   if (name.length <= max) return name;
@@ -76,9 +89,11 @@ function PreviewCell({
 function ImportPreviewTags({
   tagNames,
   tagColorByKey,
+  canCreateTags,
 }: {
   tagNames: string[];
   tagColorByKey: Map<string, string>;
+  canCreateTags: boolean;
 }) {
   const t = useTranslations('Contacts.importModal');
 
@@ -101,7 +116,13 @@ function ImportPreviewTags({
               color,
               border: `1px solid ${color}${isKnown ? '55' : '30'}`,
             }}
-            title={isKnown ? name : t('willBeCreated', { name })}
+            title={
+              isKnown
+                ? name
+                : canCreateTags
+                  ? t('willBeCreated', { name })
+                  : t('willBeSkipped', { name })
+            }
           >
             <span
               className="size-1.5 shrink-0 rounded-full"
@@ -135,28 +156,66 @@ export function ImportModal({
   const [parsedRows, setParsedRows] = useState<ParsedContactRow[]>([]);
   const [hasTagsColumn, setHasTagsColumn] = useState(false);
   const [hasCompanyColumn, setHasCompanyColumn] = useState(false);
+  const [hasExternalIdColumn, setHasExternalIdColumn] = useState(false);
+  const [operations, setOperations] = useState<Operation[]>([]);
+  const [operationId, setOperationId] = useState('');
+  const [operationsLoading, setOperationsLoading] = useState(false);
   const [tagColorByKey, setTagColorByKey] = useState<Map<string, string>>(
     new Map()
   );
   const [importing, setImporting] = useState(false);
-  const [result, setResult] = useState<{
-    imported: number;
-    skipped: number;
-    failed: number;
-    tagsAssigned: number;
-  } | null>(null);
+  const [result, setResult] = useState<ImportSummary | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    setOperationsLoading(true);
+
+    void fetch('/api/account/operations', { cache: 'no-store' })
+      .then(async (response) => {
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || t('operationsLoadError'));
+        if (cancelled) return;
+        const active = ((payload.operations ?? []) as Operation[]).filter(
+          (operation) => operation.is_active
+        );
+        setOperations(active);
+        setOperationId((current) =>
+          active.some((operation) => operation.id === current)
+            ? current
+            : ''
+        );
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error ? error.message : t('operationsLoadError')
+          );
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setOperationsLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [open, t]);
 
   function reset() {
     setFile(null);
     setParsedRows([]);
     setHasTagsColumn(false);
     setHasCompanyColumn(false);
+    setHasExternalIdColumn(false);
     setTagColorByKey(new Map());
+    setOperationId('');
     setResult(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   }
 
   function handleOpenChange(next: boolean) {
+    if (!next && importing) return;
     if (!next) reset();
     onOpenChange(next);
   }
@@ -173,6 +232,7 @@ export function ImportModal({
       rows,
       hasTagsColumn: csvHasTags,
       hasCompanyColumn: csvHasCompany,
+      hasExternalIdColumn: csvHasExternalId,
     } = parseContactCsv(text);
 
     if (rows.length === 0) {
@@ -180,6 +240,7 @@ export function ImportModal({
       setParsedRows([]);
       setHasTagsColumn(false);
       setHasCompanyColumn(false);
+      setHasExternalIdColumn(false);
       setTagColorByKey(new Map());
       return;
     }
@@ -187,6 +248,7 @@ export function ImportModal({
     setParsedRows(rows);
     setHasTagsColumn(csvHasTags);
     setHasCompanyColumn(csvHasCompany);
+    setHasExternalIdColumn(csvHasExternalId);
 
     if (csvHasTags && accountId) {
       const { data: tags } = await supabase
@@ -206,164 +268,120 @@ export function ImportModal({
   }
 
   async function handleImport() {
-    if (parsedRows.length === 0) return;
+    if (parsedRows.length === 0 || !operationId) return;
     setImporting(true);
 
+    const combined: ImportSummary = {
+      total: parsedRows.length,
+      processed: 0,
+      created: 0,
+      linkedExisting: 0,
+      alreadyLinked: 0,
+      invalid: 0,
+      conflicts: 0,
+      failed: 0,
+      tagsAssigned: 0,
+      partial: false,
+      issues: [],
+    };
+    const skippedTagNames = new Set<string>();
+    let tagsWarning = false;
+
     try {
-      const {
-        data: { session },
-      } = await supabase.auth.getSession();
-      const user = session?.user;
-      if (!user) throw new Error('Not authenticated');
-      if (!accountId)
-        throw new Error('Your profile is not linked to an account.');
+      for (let start = 0; start < parsedRows.length; start += IMPORT_CHUNK_SIZE) {
+        const rows = parsedRows.slice(start, start + IMPORT_CHUNK_SIZE);
+        const response = await fetch('/api/contacts/import', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ operationId, rows }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || t('toastError'));
 
-      let imported = 0;
-      let skipped = 0;
-      let failed = 0;
-
-      // 1) De-dupe within the file by normalized phone (keep first).
-      const { unique, duplicates: inFileDupes } = dedupeByPhone(parsedRows);
-      skipped += inFileDupes;
-
-      // 2) Skip numbers already in this account. One read of the
-      //    generated `phone_normalized` column (migration 022) → Set.
-      const { data: existingRows } = await supabase
-        .from('contacts')
-        .select('phone_normalized')
-        .eq('account_id', accountId);
-      const existing = new Set(
-        (existingRows ?? [])
-          .map(
-            (r) => (r as { phone_normalized: string | null }).phone_normalized
-          )
-          .filter((p): p is string => !!p)
-      );
-
-      const toInsert = unique.filter((row) => {
-        if (existing.has(normalizeKey(row.phone))) {
-          skipped++;
-          return false;
+        const summary = payload.summary as Omit<
+          ImportSummary,
+          'processed' | 'partial' | 'issues'
+        >;
+        combined.processed += rows.length;
+        combined.created += summary.created;
+        combined.linkedExisting += summary.linkedExisting;
+        combined.alreadyLinked += summary.alreadyLinked;
+        combined.invalid += summary.invalid;
+        combined.conflicts += summary.conflicts;
+        combined.failed += summary.failed;
+        combined.tagsAssigned += summary.tagsAssigned;
+        tagsWarning ||= payload.tagsWarning === true;
+        for (const name of (payload.skippedTagNames ?? []) as string[]) {
+          skippedTagNames.add(name);
         }
-        return true;
-      });
-
-      // 3) Resolve tag names → ids (admin+ may auto-create missing tags).
-      //    Skip the round-trip when the import carries no tag names.
-      const allTagNames = toInsert.flatMap((row) => row.tagNames);
-      let tagIdByKey = new Map<string, string>();
-      let skippedNames: string[] = [];
-      if (allTagNames.length > 0) {
-        ({ tagIdByKey, skippedNames } = await resolveImportTagIds(supabase, {
-          accountId,
-          userId: user.id,
-          tagNames: allTagNames,
-          canCreateTags: canEditSettings,
-        }));
-      }
-
-      const tagAssignments: ContactTagAssignment[] = [];
-
-      // 4) Batch insert the genuinely-new rows in chunks of 50. The DB
-      //    unique index is the backstop: a 23505 (race, or a format
-      //    that normalizes equal) counts as skipped, not failed.
-      const chunkSize = 50;
-
-      for (let i = 0; i < toInsert.length; i += chunkSize) {
-        const chunk = toInsert.slice(i, i + chunkSize);
-        const rows = chunk.map((row) => ({
-          user_id: user.id,
-          account_id: accountId,
-          phone: row.phone,
-          name: row.name || null,
-          email: row.email || null,
-          company: row.company || null,
-        }));
-
-        const { data, error } = await supabase
-          .from('contacts')
-          .insert(rows)
-          .select('id');
-
-        if (error) {
-          // Retry individually so one bad/duplicate row doesn't sink
-          // the whole chunk.
-          for (let j = 0; j < rows.length; j++) {
-            const row = rows[j];
-            const source = chunk[j];
-            const { data: singleData, error: singleErr } = await supabase
-              .from('contacts')
-              .insert(row)
-              .select('id')
-              .single();
-
-            if (!singleErr && singleData) {
-              imported++;
-              if (source.tagNames.length > 0) {
-                tagAssignments.push({
-                  contactId: singleData.id,
-                  tagNames: source.tagNames,
-                });
-              }
-            } else if (isUniqueViolation(singleErr)) {
-              skipped++;
-            } else {
-              failed++;
-            }
+        for (const issue of (payload.results ?? []) as Array<{
+          index: number;
+          status: string;
+          error?: string;
+        }>) {
+          if (
+            combined.issues.length >= 20 ||
+            !['invalid', 'conflict', 'failed'].includes(issue.status)
+          ) {
+            continue;
           }
-        } else {
-          const inserted = data ?? [];
-          imported += inserted.length;
-          // inserted[j] ↔ chunk[j] only holds because a single INSERT
-          // preserves RETURNING order. If this path is ever split into
-          // parallel inserts, zip by phone or returned id instead.
-          for (let j = 0; j < inserted.length; j++) {
-            const source = chunk[j];
-            if (!source || source.tagNames.length === 0) continue;
-            tagAssignments.push({
-              contactId: inserted[j].id,
-              tagNames: source.tagNames,
-            });
-          }
+          combined.issues.push({
+            row: start + issue.index + 2,
+            status: issue.status as ImportIssue['status'],
+            error: issue.error || t('toastError'),
+          });
         }
       }
 
-      // 5) Wire tags onto the contacts we just created. Failure here must
-      //    not mask a successful contact import.
-      let tagsAssigned = 0;
-      try {
-        tagsAssigned = await assignImportedContactTags(
-          supabase,
-          tagAssignments,
-          tagIdByKey
+      setResult({ ...combined, issues: [...combined.issues] });
+      const changed = combined.created + combined.linkedExisting;
+      const successful = changed + combined.alreadyLinked;
+      if (changed > 0) {
+        toast.success(
+          t('toastProcessed', {
+            created: combined.created,
+            linked: combined.linkedExisting,
+          })
         );
-      } catch {
-        toast.warning(t('toastTagsWarning'));
       }
-
-      setResult({ imported, skipped, failed, tagsAssigned });
-      if (imported > 0) {
-        toast.success(t('toastImported', { count: imported }));
-        onImported();
+      if (successful > 0 || combined.tagsAssigned > 0) onImported();
+      if (combined.alreadyLinked > 0) {
+        toast.info(t('toastAlreadyLinked', { count: combined.alreadyLinked }));
       }
-      if (tagsAssigned > 0) {
-        toast.success(t('toastTagsAssigned', { count: tagsAssigned }));
+      if (combined.tagsAssigned > 0) {
+        toast.success(t('toastTagsAssigned', { count: combined.tagsAssigned }));
       }
-      if (skippedNames.length > 0) {
-        const sample = skippedNames.slice(0, 3).join(', ');
-        const more =
-          skippedNames.length > 3 ? ` (+${skippedNames.length - 3} more)` : '';
+      if (tagsWarning) toast.warning(t('toastTagsWarning'));
+      if (skippedTagNames.size > 0) {
+        const names = [...skippedTagNames];
+        const sample = names.slice(0, 3).join(', ');
+        const more = names.length > 3 ? ` (+${names.length - 3})` : '';
         toast.info(t('toastTagsSkipped', { sample, more }));
       }
-      if (skipped > 0) {
-        toast.info(t('toastSkipped', { count: skipped }));
-      }
-      if (failed > 0) {
-        toast.error(t('toastFailed', { count: failed }));
-      }
+      const problems = combined.invalid + combined.conflicts + combined.failed;
+      if (problems > 0) toast.error(t('toastProblems', { count: problems }));
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : t('toastError');
-      toast.error(message);
+      if (combined.processed > 0) {
+        combined.partial = true;
+        setResult({ ...combined, issues: [...combined.issues] });
+        if (
+          combined.created + combined.linkedExisting + combined.alreadyLinked >
+            0 ||
+          combined.tagsAssigned > 0
+        ) {
+          onImported();
+        }
+        toast.warning(
+          t('toastPartial', {
+            processed: combined.processed,
+            total: combined.total,
+          })
+        );
+        toast.error(message);
+      } else {
+        toast.error(message);
+      }
     } finally {
       setImporting(false);
     }
@@ -378,6 +396,8 @@ export function ImportModal({
   // avoiding an all-dash column that wastes horizontal space.
   const previewHasCompany =
     hasCompanyColumn && preview.some((row) => row.company?.trim());
+  const previewHasExternalId =
+    hasExternalIdColumn && preview.some((row) => row.externalId?.trim());
 
   const tagStats = useMemo(() => {
     const names = new Set<string>();
@@ -406,24 +426,76 @@ export function ImportModal({
                   emailCode: (chunks) => `<code class="rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">${chunks}</code>`,
                   companyCode: (chunks) => `<code class="rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">${chunks}</code>`,
                   tagsCode: (chunks) => `<code class="rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">${chunks}</code>`,
+                  externalIdCode: (chunks) => `<code class="rounded bg-muted px-1 py-0.5 text-[11px] text-muted-foreground">${chunks}</code>`,
                 })
               }}
             />
           </DialogHeader>
 
+          <div className="rounded-xl border border-border/80 bg-background/45 p-3">
+            <div className="flex items-start gap-3">
+              <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
+                <Network className="size-4" />
+              </div>
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <label
+                  htmlFor="import-operation"
+                  className="block text-xs font-medium text-foreground"
+                >
+                  {t('operationLabel')}
+                </label>
+                <select
+                  id="import-operation"
+                  value={operationId}
+                  onChange={(event) => setOperationId(event.target.value)}
+                  disabled={
+                    operationsLoading || operations.length === 0 || importing
+                  }
+                  className="h-9 w-full rounded-lg border border-border bg-muted px-2.5 text-sm text-foreground outline-none focus:border-primary focus:ring-1 focus:ring-primary disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {operationsLoading ? (
+                    <option value="">{t('operationsLoading')}</option>
+                  ) : operations.length === 0 ? (
+                    <option value="">{t('noOperationsOption')}</option>
+                  ) : (
+                    <>
+                      <option value="" disabled>
+                        {t('selectOperation')}
+                      </option>
+                      {operations.map((operation) => (
+                        <option key={operation.id} value={operation.id}>
+                          {operation.name}
+                        </option>
+                      ))}
+                    </>
+                  )}
+                </select>
+                <p className="text-[11px] text-muted-foreground">
+                  {operations.length === 0 && !operationsLoading
+                    ? t('noOperationsHint')
+                    : t('operationHint')}
+                </p>
+              </div>
+            </div>
+          </div>
+
           <div
             role="button"
-            tabIndex={0}
-            onClick={() => fileInputRef.current?.click()}
+            tabIndex={importing ? -1 : 0}
+            aria-disabled={importing}
+            onClick={() => {
+              if (!importing) fileInputRef.current?.click();
+            }}
             onKeyDown={(e) => {
-              if (e.key === 'Enter' || e.key === ' ')
+              if (!importing && (e.key === 'Enter' || e.key === ' '))
                 fileInputRef.current?.click();
             }}
             className={cn(
               'group flex cursor-pointer flex-col items-center justify-center gap-2 rounded-xl border border-dashed p-5 transition-all',
               file
                 ? 'border-primary/35 bg-primary/[0.04]'
-                : 'hover:border-primary/40 border-border/80 bg-background/40 hover:bg-background/70'
+                : 'hover:border-primary/40 border-border/80 bg-background/40 hover:bg-background/70',
+              importing && 'pointer-events-none opacity-60'
             )}
           >
             {file ? (
@@ -460,6 +532,7 @@ export function ImportModal({
             ref={fileInputRef}
             type="file"
             accept=".csv,text/csv"
+            disabled={importing}
             onChange={handleFileChange}
             className="hidden"
           />
@@ -499,6 +572,11 @@ export function ImportModal({
                         {previewHasCompany && (
                           <th className="px-3 py-2 text-left font-medium whitespace-nowrap text-muted-foreground">
                             {t('columns.company')}
+                          </th>
+                        )}
+                        {previewHasExternalId && (
+                          <th className="px-3 py-2 text-left font-medium whitespace-nowrap text-muted-foreground">
+                            {t('columns.externalId')}
                           </th>
                         )}
                         {previewHasTags && (
@@ -541,11 +619,21 @@ export function ImportModal({
                               />
                             </td>
                           )}
+                          {previewHasExternalId && (
+                            <td className="px-3 py-2 text-muted-foreground">
+                              <PreviewCell
+                                value={row.externalId || '—'}
+                                mono
+                                maxWidth="max-w-[8rem]"
+                              />
+                            </td>
+                          )}
                           {previewHasTags && (
                             <td className="px-3 py-2 align-top">
                               <ImportPreviewTags
                                 tagNames={row.tagNames}
                                 tagColorByKey={tagColorByKey}
+                                canCreateTags={canEditSettings}
                               />
                             </td>
                           )}
@@ -566,12 +654,34 @@ export function ImportModal({
 
           {result && (
             <div className="rounded-xl border border-border bg-background/50 p-4">
-              <p className="text-sm font-medium text-popover-foreground">{t('importComplete')}</p>
+              <p className="text-sm font-medium text-popover-foreground">
+                {result.partial ? t('importPartial') : t('importComplete')}
+              </p>
+              {result.partial && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t('resultProcessed', {
+                    processed: result.processed,
+                    total: result.total,
+                  })}
+                </p>
+              )}
               <div className="mt-3 flex flex-wrap gap-3">
-                {result.imported > 0 && (
+                {result.created > 0 && (
                   <div className="text-primary flex items-center gap-1.5 text-sm">
                     <CheckCircle className="size-4 shrink-0" />
-                    {t('resultImported', { count: result.imported })}
+                    {t('resultCreated', { count: result.created })}
+                  </div>
+                )}
+                {result.linkedExisting > 0 && (
+                  <div className="flex items-center gap-1.5 text-sm text-cyan-400">
+                    <Network className="size-4 shrink-0" />
+                    {t('resultLinked', { count: result.linkedExisting })}
+                  </div>
+                )}
+                {result.alreadyLinked > 0 && (
+                  <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+                    <CheckCircle className="size-4 shrink-0" />
+                    {t('resultAlreadyLinked', { count: result.alreadyLinked })}
                   </div>
                 )}
                 {result.tagsAssigned > 0 && (
@@ -580,10 +690,12 @@ export function ImportModal({
                     {t('resultTags', { count: result.tagsAssigned })}
                   </div>
                 )}
-                {result.skipped > 0 && (
+                {result.invalid + result.conflicts > 0 && (
                   <div className="flex items-center gap-1.5 text-sm text-amber-400">
                     <AlertTriangle className="size-4 shrink-0" />
-                    {t('resultSkipped', { count: result.skipped })}
+                    {t('resultProblems', {
+                      count: result.invalid + result.conflicts,
+                    })}
                   </div>
                 )}
                 {result.failed > 0 && (
@@ -593,6 +705,31 @@ export function ImportModal({
                   </div>
                 )}
               </div>
+              {result.issues.length > 0 && (
+                <div className="mt-3 rounded-lg border border-border/70 bg-muted/35 p-3">
+                  <p className="text-xs font-medium text-foreground">
+                    {t('issuesTitle')}
+                  </p>
+                  <ul className="mt-1.5 space-y-1 text-[11px] text-muted-foreground">
+                    {result.issues.slice(0, 8).map((issue) => (
+                      <li key={`${issue.row}-${issue.status}`}>
+                        {t('issueRow', { row: issue.row, error: issue.error })}
+                      </li>
+                    ))}
+                  </ul>
+                  {result.invalid + result.conflicts + result.failed > 8 && (
+                    <p className="mt-1.5 text-[11px] text-muted-foreground">
+                      {t('issuesMore', {
+                        count:
+                          result.invalid +
+                          result.conflicts +
+                          result.failed -
+                          8,
+                      })}
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -602,6 +739,7 @@ export function ImportModal({
             type="button"
             variant="outline"
             onClick={() => handleOpenChange(false)}
+            disabled={importing}
             className="border-border text-muted-foreground hover:bg-muted"
           >
             {result ? t('close') : t('cancel')}
@@ -609,7 +747,12 @@ export function ImportModal({
           {!result && (
             <Button
               type="button"
-              disabled={parsedRows.length === 0 || importing}
+              disabled={
+                parsedRows.length === 0 ||
+                !operationId ||
+                importing ||
+                operationsLoading
+              }
               onClick={handleImport}
               className="bg-primary hover:bg-primary/90 text-primary-foreground"
             >

@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { SupabaseClient } from '@supabase/supabase-js';
+import { calculateEngagementScore } from '@/lib/contacts/engagement';
 
 import {
   serializeContact,
@@ -16,6 +17,14 @@ describe('serializeContact', () => {
       email: null,
       company: 'Acme',
       avatar_url: null,
+      message_count: 9,
+      last_message_at: '2026-01-02T11:00:00Z',
+      response_rate: 75,
+      avg_response_time: 180,
+      engagement_score: 64,
+      first_seen_at: '2025-12-20T00:00:00Z',
+      last_contacted_at: '2026-01-02T11:00:00Z',
+      opt_out: false,
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-02T00:00:00Z',
       contact_tags: [
@@ -30,6 +39,14 @@ describe('serializeContact', () => {
       email: null,
       company: 'Acme',
       avatar_url: null,
+      message_count: 9,
+      last_message_at: '2026-01-02T11:00:00Z',
+      response_rate: 75,
+      avg_response_time: 180,
+      engagement_score: calculateEngagementScore(row),
+      first_seen_at: '2025-12-20T00:00:00Z',
+      last_contacted_at: '2026-01-02T11:00:00Z',
+      opt_out: false,
       tags: [{ id: 't1', name: 'vip', color: '#fff' }],
       created_at: '2026-01-01T00:00:00Z',
       updated_at: '2026-01-02T00:00:00Z',
@@ -48,6 +65,16 @@ describe('serializeContact', () => {
       updated_at: 'b',
     };
     expect(serializeContact(row).tags).toEqual([]);
+    expect(serializeContact(row)).toMatchObject({
+      message_count: 0,
+      last_message_at: null,
+      response_rate: 0,
+      avg_response_time: null,
+      engagement_score: 0,
+      first_seen_at: null,
+      last_contacted_at: null,
+      opt_out: false,
+    });
   });
 });
 

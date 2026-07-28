@@ -118,12 +118,15 @@ async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: str
   // new tenancy column.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, opt_out')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
   if (contactErr || !contact?.phone) {
     throw new Error('contact not found for this account')
+  }
+  if (contact.opt_out === true) {
+    throw new Error('contact has opted out of outbound messages')
   }
 
   const sanitized = sanitizePhoneForMeta(contact.phone)

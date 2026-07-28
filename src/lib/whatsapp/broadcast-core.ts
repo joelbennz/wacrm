@@ -58,6 +58,7 @@ export interface CreateBroadcastParams {
 
 interface PlannedRecipient {
   recipientRowId: string;
+  contactId: string;
   phone: string;
   params: string[];
 }
@@ -156,6 +157,16 @@ export async function createBroadcast(
     const { id } = await findOrCreateContact(db, accountId, auditUserId, {
       phone: sanitized,
     });
+    const { data: contact } = await db
+      .from('contacts')
+      .select('opt_out')
+      .eq('account_id', accountId)
+      .eq('id', id)
+      .maybeSingle();
+    if (contact?.opt_out === true) {
+      rejected++;
+      continue;
+    }
     resolved.push({
       contactId: id,
       phone: sanitized,
@@ -231,7 +242,12 @@ export async function createBroadcast(
   const byContact = new Map(deduped.map((r) => [r.contactId, r]));
   const planned: PlannedRecipient[] = recipientRows.map((row) => {
     const r = byContact.get(row.contact_id as string)!;
-    return { recipientRowId: row.id as string, phone: r.phone, params: r.params };
+    return {
+      recipientRowId: row.id as string,
+      contactId: row.contact_id as string,
+      phone: r.phone,
+      params: r.params,
+    };
   });
 
   return {
@@ -266,6 +282,26 @@ export async function deliverBroadcast(
   let sentCount = 0;
 
   for (const recipient of plan.planned) {
+    // Re-check opt-out right before sending, not just at plan time.
+    // deliverBroadcast runs inside after() (up to maxDuration=60s) for
+    // as many as MAX_RECIPIENTS recipients, so a contact can opt out
+    // between createBroadcast()'s one-time filter and their turn here.
+    const { data: liveContact } = await db
+      .from('contacts')
+      .select('opt_out')
+      .eq('id', recipient.contactId)
+      .maybeSingle();
+    if (liveContact?.opt_out === true) {
+      await db
+        .from('broadcast_recipients')
+        .update({
+          status: 'failed',
+          error_message: 'Contact opted out of outbound messages',
+        })
+        .eq('id', recipient.recipientRowId);
+      continue;
+    }
+
     const variants = phoneVariants(recipient.phone);
     let sentMessageId: string | null = null;
     let lastError: string | null = null;

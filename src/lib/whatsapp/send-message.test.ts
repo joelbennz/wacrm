@@ -157,3 +157,40 @@ describe('SendMessageError', () => {
     expect(e).toBeInstanceOf(Error);
   });
 });
+
+describe('sendMessageToConversation — contact consent', () => {
+  it('blocks an opted-out contact before loading WhatsApp config or calling Meta', async () => {
+    const chain = {
+      select: vi.fn(),
+      eq: vi.fn(),
+      single: vi.fn().mockResolvedValue({
+        data: {
+          id: 'cv-1',
+          contact: {
+            id: 'contact-1',
+            phone: '+244923000000',
+            opt_out: true,
+          },
+        },
+        error: null,
+      }),
+    };
+    chain.select.mockReturnValue(chain);
+    chain.eq.mockReturnValue(chain);
+    const from = vi.fn().mockReturnValue(chain);
+    const db = { from } as unknown as SupabaseClient;
+
+    await expect(
+      sendMessageToConversation(db, 'acct-1', {
+        conversationId: 'cv-1',
+        messageType: 'text',
+        contentText: 'Olá',
+      })
+    ).rejects.toMatchObject({
+      code: 'contact_opted_out',
+      status: 409,
+    });
+    expect(from).toHaveBeenCalledTimes(1);
+    expect(from).toHaveBeenCalledWith('conversations');
+  });
+});

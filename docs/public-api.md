@@ -162,7 +162,7 @@ Response (201):
 
 Domain error codes beyond the table above: `whatsapp_not_configured`
 (400), `meta_error` (502 — the request reached Meta and it rejected the
-send), `template_malformed` (500).
+send), `contact_opted_out` (409), `template_malformed` (500).
 
 ### `GET /api/v1/contacts`
 
@@ -176,6 +176,10 @@ or phone) and `?tag=<tagId>`.
     {
       "id": "…", "phone": "+14155550123", "name": "Jane Doe",
       "email": null, "company": "Acme", "avatar_url": null,
+      "message_count": 14, "last_message_at": "…",
+      "response_rate": 72, "avg_response_time": 180,
+      "engagement_score": 68, "first_seen_at": "…",
+      "last_contacted_at": "…", "opt_out": false,
       "tags": [{ "id": "…", "name": "vip", "color": "#3b82f6" }],
       "created_at": "…", "updated_at": "…"
     }
@@ -193,12 +197,74 @@ match returns `200` with the existing contact; a new contact returns
 `201`. The response body is the serialized contact (same shape as the
 list rows above).
 
+**Multi-source ingestion (optional):** pass `operationId` (the UUID of
+an existing, active Operation — see Settings → Operations) to record
+which external system this contact came from, instead of a plain
+find-or-create. When set:
+
+- `externalId` (optional) is that source's own stable identifier for
+  the contact — pass it so re-sending the same person later (e.g. a
+  webhook retry, or a re-sync) updates the existing link instead of
+  guessing by phone alone. A given `externalId` is unique per
+  operation; reusing one with a *different* phone number is rejected
+  (`409 conflict`) rather than silently relinking it.
+- Matching an existing contact never overwrites fields you've already
+  edited in the CRM — `name`/`email`/`company` only fill in if blank.
+- The response includes `ingestion_status`: `"created"` (new contact,
+  `201`), `"linked_existing"` (matched an existing contact by phone,
+  now also linked to this operation, `200`), or `"already_linked"`
+  (this external record was already linked here, `200`).
+- Archived operations reject new links (`409`).
+
+```bash
+curl -X POST https://your-crm.example.com/api/v1/contacts \
+  -H "Authorization: Bearer wacrm_live_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "phone": "+244923000000",
+        "name": "Jane Doe",
+        "email": "jane@example.com",
+        "operationId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "externalId": "order_9f21c1"
+      }'
+```
+
 ### `GET` / `PATCH /api/v1/contacts/{id}`
 
 Read or update one contact. Scopes: `contacts:read` / `contacts:write`.
-`PATCH` updates only the fields you send (`name`, `email`, `company`);
-pass `tags` (an array of tag names) to replace the contact's tags. A
-contact in another account returns `404`.
+`PATCH` updates only the fields you send (`name`, `email`, `company`,
+`opt_out`); pass `tags` (an array of tag names) to replace the contact's
+tags. Engagement fields are read-only and maintained from conversation
+messages. A contact in another account returns `404`.
+
+### `POST /api/v1/deals`
+
+Create a deal. Scope: `deals:write`. Create-only (no list/read/update yet
+on this path — manage the deal from the dashboard once created).
+
+Required: `contactId` (UUID, must already exist — create it first via
+`POST /api/v1/contacts`), `pipelineId` (UUID), `title`, `value` (number,
+≥0). Optional: `stageId` (defaults to the pipeline's first stage),
+`currency` (ISO-4217, defaults to `USD`), `status` (defaults to `open`
+— pass `won` to record an already-closed sale), `notes`.
+
+```bash
+curl -X POST https://your-crm.example.com/api/v1/deals \
+  -H "Authorization: Bearer wacrm_live_xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "contactId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+        "pipelineId": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+        "title": "Premium plan",
+        "value": 5000,
+        "currency": "AOA",
+        "status": "won"
+      }'
+```
+
+No idempotency key on this endpoint yet — calling it twice for the same
+sale creates two deals. If your integration might retry a webhook
+delivery, de-duplicate on your side before calling.
 
 ### `GET /api/v1/conversations`
 
@@ -242,8 +308,8 @@ curl -X POST https://your-crm.example.com/api/v1/broadcasts \
 ```
 
 Recipients are capped at **1000 per request** — split larger sends.
-Invalid phone numbers are dropped and counted as `rejected`. Response
-(202):
+Invalid phone numbers and contacts with `opt_out=true` are dropped and
+counted as `rejected`. Response (202):
 
 ```json
 {

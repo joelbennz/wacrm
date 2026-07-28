@@ -24,6 +24,11 @@ import {
   resolveAuditUserId,
   ContactError,
 } from '@/lib/api/v1/contacts';
+import { isUuid } from '@/lib/operations/validation';
+import {
+  ingestOperationContact,
+  ContactIngestionError,
+} from '@/lib/operations/ingest-contact';
 
 // PostgREST filter values are comma/paren-delimited; strip anything
 // that could break the `.or()` grammar before interpolating a search
@@ -111,6 +116,66 @@ export async function POST(request: Request) {
     }
 
     const auditUserId = await resolveAuditUserId(ctx.supabase, ctx.accountId);
+
+    // Optional operation-scoped ingestion: when the caller identifies
+    // which "operation" (external project/source) this contact came
+    // from, route through the same ingestion path CSV import uses —
+    // it resolves by external_id first, falls back to phone, never
+    // overwrites fields the CRM already has, and records the source
+    // link (see src/lib/operations/ingest-contact.ts). Without an
+    // operationId, behaviour is unchanged: a plain find-or-create.
+    const operationId =
+      typeof body.operationId === 'string' ? body.operationId.trim() : '';
+    if (operationId) {
+      if (!isUuid(operationId)) {
+        return fail('bad_request', "'operationId' must be a UUID", 400);
+      }
+      try {
+        const result = await ingestOperationContact(ctx.supabase, {
+          accountId: ctx.accountId,
+          userId: auditUserId,
+          operationId,
+          method: 'api',
+          input: {
+            phone,
+            name: typeof body.name === 'string' ? body.name : undefined,
+            email: typeof body.email === 'string' ? body.email : undefined,
+            company: typeof body.company === 'string' ? body.company : undefined,
+            externalId:
+              typeof body.externalId === 'string' ? body.externalId : undefined,
+          },
+        });
+
+        if (Array.isArray(body.tags)) {
+          await setContactTags(
+            ctx.supabase,
+            ctx.accountId,
+            auditUserId,
+            result.contactId,
+            body.tags.filter((t): t is string => typeof t === 'string')
+          );
+        }
+
+        const contact = await getContactById(
+          ctx.supabase,
+          ctx.accountId,
+          result.contactId
+        );
+        return ok(
+          { ...contact, ingestion_status: result.status },
+          result.status === 'created' ? 201 : 200
+        );
+      } catch (err) {
+        if (err instanceof ContactIngestionError) {
+          return fail(
+            err.kind === 'invalid' ? 'bad_request' : 'conflict',
+            err.message,
+            err.kind === 'invalid' ? 400 : 409
+          );
+        }
+        throw err;
+      }
+    }
 
     const { id, created } = await findOrCreateContact(
       ctx.supabase,

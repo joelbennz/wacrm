@@ -29,6 +29,7 @@ export interface CurrencyOption {
  */
 export const CURRENCIES: CurrencyOption[] = [
   { code: "USD", label: "US Dollar", symbol: "$" },
+  { code: "AOA", label: "Angolan Kwanza", symbol: "Kz" },
   { code: "EUR", label: "Euro", symbol: "€" },
   { code: "GBP", label: "British Pound", symbol: "£" },
   { code: "INR", label: "Indian Rupee", symbol: "₹" },

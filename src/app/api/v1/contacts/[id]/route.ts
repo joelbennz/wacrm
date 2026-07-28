@@ -5,7 +5,8 @@
 // Both are account-scoped: a contact belonging to another account
 // returns 404 (never 403 — don't reveal it exists elsewhere).
 // PATCH updates only the fields present in the body; pass `tags` (an
-// array of tag names) to replace the contact's tags.
+// array of tag names) to replace the contact's tags. `opt_out` controls
+// whether the contact can receive outbound marketing messages.
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
@@ -65,6 +66,13 @@ export async function PATCH(
       } else {
         return fail('bad_request', `'${field}' must be a string or null`, 400);
       }
+    }
+
+    if ('opt_out' in body) {
+      if (typeof body.opt_out !== 'boolean') {
+        return fail('bad_request', "'opt_out' must be a boolean", 400);
+      }
+      updates.opt_out = body.opt_out;
     }
 
     if (Object.keys(updates).length > 0) {

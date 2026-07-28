@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { toast } from 'sonner';
-import type { Contact, Tag, ContactTag } from '@/types';
+import type { Contact, Tag, ContactTag, Operation } from '@/types';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -57,6 +57,7 @@ import { CustomFieldsManager } from '@/components/contacts/custom-fields-manager
 import { useCan } from '@/hooks/use-can';
 import { GatedButton } from '@/components/ui/gated-button';
 import { useTranslations } from 'next-intl';
+import { calculateEngagementScore } from '@/lib/contacts/engagement';
 
 const PAGE_SIZE = 25;
 
@@ -75,6 +76,7 @@ export default function ContactsPage() {
   const [search, setSearch] = useState('');
   const [page, setPage] = useState(0);
   const [totalCount, setTotalCount] = useState(0);
+  const [engagementClock, setEngagementClock] = useState(() => Date.now());
   // Tag filter — contacts shown must have ANY of these tags (OR).
   const [selectedTagIds, setSelectedTagIds] = useState<string[]>([]);
 
@@ -102,6 +104,9 @@ export default function ContactsPage() {
   // results. Without this, rapidly toggling tag filters could let a slower
   // earlier request resolve last and render stale rows.
   const fetchSeq = useRef(0);
+  const realtimeRefreshTimer = useRef<ReturnType<typeof setTimeout> | null>(
+    null
+  );
 
   const fetchTags = useCallback(async () => {
     const { data } = await supabase.from('tags').select('*');
@@ -118,13 +123,13 @@ export default function ContactsPage() {
     }
   }, [supabase]);
 
-  const fetchContacts = useCallback(async () => {
+  const fetchContacts = useCallback(async (background = false) => {
     const seq = ++fetchSeq.current;
-    setLoading(true);
+    if (!background) setLoading(true);
     // The visible rows are about to change — drop any selection that
     // referred to the old page/search results so the bulk bar can't
     // act on rows the user can no longer see.
-    setSelected(new Set());
+    if (!background) setSelected(new Set());
 
     const from = page * PAGE_SIZE;
     const to = from + PAGE_SIZE - 1;
@@ -146,8 +151,10 @@ export default function ContactsPage() {
       });
       if (seq !== fetchSeq.current) return; // superseded by a newer fetch
       if (error) {
-        toast.error(t('toastFailedLoad'));
-        setLoading(false);
+        if (!background) {
+          toast.error(t('toastFailedLoad'));
+          setLoading(false);
+        }
         return;
       }
       const rows = (data ?? []) as { contact: Contact; total_count: number }[];
@@ -168,8 +175,10 @@ export default function ContactsPage() {
       const { data, count: exactCount, error } = await query;
       if (seq !== fetchSeq.current) return; // superseded by a newer fetch
       if (error) {
-        toast.error(t('toastFailedLoad'));
-        setLoading(false);
+        if (!background) {
+          toast.error(t('toastFailedLoad'));
+          setLoading(false);
+        }
         return;
       }
       contactRows = data ?? [];
@@ -180,16 +189,23 @@ export default function ContactsPage() {
 
     if (contactRows.length === 0) {
       setContacts([]);
-      setLoading(false);
+      if (background) setSelected(new Set());
+      else setLoading(false);
       return;
     }
 
     // Fetch tags for these contacts
     const contactIds = contactRows.map((c) => c.id);
-    const { data: contactTags } = await supabase
-      .from('contact_tags')
-      .select('contact_id, tag_id')
-      .in('contact_id', contactIds);
+    const [{ data: contactTags }, { data: sourceLinks }] = await Promise.all([
+      supabase
+        .from('contact_tags')
+        .select('contact_id, tag_id')
+        .in('contact_id', contactIds),
+      supabase
+        .from('contact_operations')
+        .select('contact_id, operation_id')
+        .in('contact_id', contactIds),
+    ]);
     if (seq !== fetchSeq.current) return; // superseded by a newer fetch
 
     const tagsByContact: Record<string, string[]> = {};
@@ -198,15 +214,52 @@ export default function ContactsPage() {
       tagsByContact[ct.contact_id].push(ct.tag_id);
     });
 
+    const operationIds = [
+      ...new Set((sourceLinks ?? []).map((link) => link.operation_id)),
+    ];
+    const { data: operationRows } = operationIds.length
+      ? await supabase
+          .from('operations')
+          .select('id, account_id, name, color, is_active, created_by, created_at, updated_at')
+          .in('id', operationIds)
+      : { data: [] };
+    if (seq !== fetchSeq.current) return;
+
+    const operationById = new Map(
+      ((operationRows ?? []) as Operation[]).map((operation) => [
+        operation.id,
+        operation,
+      ])
+    );
+    const operationsByContact = new Map<string, Operation[]>();
+    for (const link of sourceLinks ?? []) {
+      const operation = operationById.get(link.operation_id);
+      if (!operation) continue;
+      const current = operationsByContact.get(link.contact_id) ?? [];
+      current.push(operation);
+      operationsByContact.set(link.contact_id, current);
+    }
+
     const enriched: ContactWithTags[] = contactRows.map((c) => ({
       ...c,
       tags: (tagsByContact[c.id] ?? [])
         .map((tid) => tagsMap[tid])
         .filter(Boolean),
+      operations: operationsByContact.get(c.id) ?? [],
     }));
 
     setContacts(enriched);
-    setLoading(false);
+    if (background) {
+      const visibleIds = new Set(enriched.map((contact) => contact.id));
+      setSelected((current) => {
+        const pruned = new Set(
+          [...current].filter((contactId) => visibleIds.has(contactId))
+        );
+        return pruned.size === current.size ? current : pruned;
+      });
+    } else {
+      setLoading(false);
+    }
   }, [supabase, page, search, selectedTagIds, tagsMap, t]);
 
   // Load-once-on-mount-ish data fetches. Each setter inside runs
@@ -222,6 +275,68 @@ export default function ContactsPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     fetchContacts();
   }, [fetchContacts]);
+
+  useEffect(() => {
+    const scheduleRefresh = () => {
+      // Coalesce bursts without postponing forever: while events keep
+      // arriving, one background refresh still runs at least every second.
+      if (realtimeRefreshTimer.current) return;
+      realtimeRefreshTimer.current = setTimeout(() => {
+        realtimeRefreshTimer.current = null;
+        void fetchContacts(true);
+      }, 1_000);
+    };
+
+    const channel = supabase
+      .channel('contacts-page-live')
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'contacts' },
+        scheduleRefresh
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'contacts' },
+        scheduleRefresh
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'contact_operations' },
+        scheduleRefresh
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'contact_operations' },
+        scheduleRefresh
+      )
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'operations' },
+        scheduleRefresh
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'operations' },
+        scheduleRefresh
+      )
+      .subscribe();
+
+    return () => {
+      if (realtimeRefreshTimer.current) {
+        clearTimeout(realtimeRefreshTimer.current);
+        realtimeRefreshTimer.current = null;
+      }
+      void supabase.removeChannel(channel);
+    };
+  }, [supabase, fetchContacts]);
+
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => setEngagementClock(Date.now()),
+      60_000
+    );
+    return () => window.clearInterval(timer);
+  }, []);
 
   function openAddForm() {
     setEditContact(null);
@@ -545,6 +660,9 @@ export default function ContactsPage() {
               <TableHead className="text-muted-foreground">{t('tableColumns.phone')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.email')}</TableHead>
               <TableHead className="text-muted-foreground hidden lg:table-cell">{t('tableColumns.company')}</TableHead>
+              <TableHead className="text-muted-foreground hidden xl:table-cell text-center">{t('tableColumns.messageCount')}</TableHead>
+              <TableHead className="text-muted-foreground hidden xl:table-cell text-center">{t('tableColumns.responseRate')}</TableHead>
+              <TableHead className="text-muted-foreground hidden lg:table-cell text-center">{t('tableColumns.engagementScore')}</TableHead>
               <TableHead className="text-muted-foreground hidden md:table-cell">{t('tableColumns.tags')}</TableHead>
               <TableHead className="text-muted-foreground hidden lg:table-cell">{t('tableColumns.createdAt')}</TableHead>
               <TableHead className="text-muted-foreground w-12" />
@@ -553,7 +671,7 @@ export default function ContactsPage() {
           <TableBody>
             {loading ? (
               <TableRow className="border-border">
-                <TableCell colSpan={8} className="text-center py-12">
+                <TableCell colSpan={11} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Loader2 className="size-6 animate-spin text-primary" />
                     <p className="text-sm text-muted-foreground">{t('loading')}</p>
@@ -562,7 +680,7 @@ export default function ContactsPage() {
               </TableRow>
             ) : contacts.length === 0 ? (
               <TableRow className="border-border">
-                <TableCell colSpan={8} className="text-center py-12">
+                <TableCell colSpan={11} className="text-center py-12">
                   <div className="flex flex-col items-center gap-2">
                     <Users className="size-8 text-muted-foreground" />
                     <p className="text-sm text-muted-foreground">
@@ -601,7 +719,41 @@ export default function ContactsPage() {
                     />
                   </TableCell>
                   <TableCell className="text-foreground font-medium">
-                    {contact.name || <span className="text-muted-foreground italic">{t('unnamed')}</span>}
+                    <div className="min-w-0">
+                      <div className="truncate">
+                        {contact.name || (
+                          <span className="text-muted-foreground italic">
+                            {t('unnamed')}
+                          </span>
+                        )}
+                      </div>
+                      {contact.operations && contact.operations.length > 0 && (
+                        <div className="mt-1 flex max-w-[13rem] flex-wrap gap-1">
+                          {contact.operations.slice(0, 2).map((operation) => (
+                            <span
+                              key={operation.id}
+                              className="inline-flex max-w-[8rem] items-center gap-1 rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                              style={{
+                                backgroundColor: `${operation.color}18`,
+                                color: operation.color,
+                              }}
+                              title={operation.name}
+                            >
+                              <span
+                                className="size-1.5 shrink-0 rounded-full"
+                                style={{ backgroundColor: operation.color }}
+                              />
+                              <span className="truncate">{operation.name}</span>
+                            </span>
+                          ))}
+                          {contact.operations.length > 2 && (
+                            <span className="text-[9px] text-muted-foreground">
+                              +{contact.operations.length - 2}
+                            </span>
+                          )}
+                        </div>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell className="text-muted-foreground font-mono text-xs">
                     {contact.phone}
@@ -611,6 +763,15 @@ export default function ContactsPage() {
                   </TableCell>
                   <TableCell className="text-muted-foreground hidden lg:table-cell text-sm">
                     {contact.company || <span className="text-muted-foreground">-</span>}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground hidden xl:table-cell text-xs text-center">
+                    {contact.message_count?.toString() ?? '0'}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground hidden xl:table-cell text-xs text-center">
+                    {(contact.response_rate ?? 0).toFixed(0)}%
+                  </TableCell>
+                  <TableCell className="text-muted-foreground hidden lg:table-cell text-xs text-center">
+                    {calculateEngagementScore(contact, engagementClock).toFixed(0)}
                   </TableCell>
                   <TableCell className="hidden md:table-cell">
                     <div className="flex flex-wrap gap-1">

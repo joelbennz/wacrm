@@ -237,6 +237,13 @@ export async function sendMessageToConversation(
       400
     );
   }
+  if (contact.opt_out === true) {
+    throw new SendMessageError(
+      'contact_opted_out',
+      'This contact has opted out of outbound messages',
+      409
+    );
+  }
 
   const sanitizedPhone = sanitizePhoneForMeta(contact.phone);
   if (!isValidE164(sanitizedPhone)) {

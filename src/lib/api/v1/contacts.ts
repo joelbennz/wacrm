@@ -11,10 +11,14 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 
 import { findExistingContact, isUniqueViolation } from '@/lib/contacts/dedupe';
 import { resolveImportTagIds } from '@/lib/contacts/resolve-import-tags';
+import { calculateEngagementScore } from '@/lib/contacts/engagement';
 import { sanitizePhoneForMeta, isValidE164 } from '@/lib/whatsapp/phone-utils';
 
-/** Row select that embeds the contact's tags for serialization. */
-export const CONTACT_SELECT = '*, contact_tags(tags(*))';
+/** Row select that includes engagement metrics and contact's tags for serialization. */
+export const CONTACT_SELECT = `
+  *,
+  contact_tags(tags(*))
+`;
 
 export interface ApiContact {
   id: string;
@@ -23,6 +27,15 @@ export interface ApiContact {
   email: string | null;
   company: string | null;
   avatar_url: string | null;
+  /** Engagement metrics */
+  message_count: number;
+  last_message_at: string | null;
+  response_rate: number; // percentage (0-100)
+  avg_response_time: number | null; // seconds
+  engagement_score: number; // 0-100 composite score
+  first_seen_at: string | null;
+  last_contacted_at: string | null;
+  opt_out: boolean;
   tags: { id: string; name: string; color: string }[];
   created_at: string;
   updated_at: string;
@@ -50,6 +63,19 @@ export function serializeContact(row: Record<string, unknown>): ApiContact {
     email: (row.email as string | null) ?? null,
     company: (row.company as string | null) ?? null,
     avatar_url: (row.avatar_url as string | null) ?? null,
+    // Engagement metrics
+    message_count: (row.message_count as number) ?? 0,
+    last_message_at: (row.last_message_at as string | null) ?? null,
+    response_rate: (row.response_rate as number) ?? 0,
+    avg_response_time: (row.avg_response_time as number | null) ?? null,
+    engagement_score: calculateEngagementScore({
+      message_count: row.message_count as number | null,
+      response_rate: row.response_rate as number | null,
+      last_message_at: row.last_message_at as string | null,
+    }),
+    first_seen_at: (row.first_seen_at as string | null) ?? null,
+    last_contacted_at: (row.last_contacted_at as string | null) ?? null,
+    opt_out: (row.opt_out as boolean) ?? false,
     tags: joins
       .map((j) => j.tags)
       .filter((t): t is NonNullable<RawTagJoin['tags']> => t != null)

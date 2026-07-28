@@ -179,6 +179,27 @@ export async function POST(request: Request) {
     let sentCount = 0
     let failedCount = 0
 
+    const normalizedPhones = [
+      ...new Set(
+        recipients
+          .map((recipient) => sanitizePhoneForMeta(recipient.phone))
+          .filter(isValidE164)
+      ),
+    ]
+    const { data: optedOutRows } = normalizedPhones.length
+      ? await supabase
+          .from('contacts')
+          .select('phone_normalized')
+          .eq('account_id', accountId)
+          .eq('opt_out', true)
+          .in('phone_normalized', normalizedPhones)
+      : { data: [] }
+    const optedOutPhones = new Set(
+      (optedOutRows ?? [])
+        .map((row) => row.phone_normalized as string | null)
+        .filter((phone): phone is string => !!phone)
+    )
+
     for (const recipient of recipients) {
       const sanitized = sanitizePhoneForMeta(recipient.phone)
 
@@ -187,6 +208,35 @@ export async function POST(request: Request) {
           phone: recipient.phone,
           status: 'failed',
           error: 'Invalid phone number format',
+        })
+        failedCount++
+        continue
+      }
+      if (optedOutPhones.has(sanitized)) {
+        results.push({
+          phone: recipient.phone,
+          status: 'failed',
+          error: 'Contact has opted out of outbound messages',
+        })
+        failedCount++
+        continue
+      }
+
+      // Re-check right before sending, not just against the batch
+      // snapshotted before this loop started. For a large recipient
+      // list this loop can run long enough for a contact to opt out
+      // (e.g. reply STOP, processed via webhook) mid-broadcast.
+      const { data: liveContact } = await supabase
+        .from('contacts')
+        .select('opt_out')
+        .eq('account_id', accountId)
+        .eq('phone_normalized', sanitized)
+        .maybeSingle()
+      if (liveContact?.opt_out === true) {
+        results.push({
+          phone: recipient.phone,
+          status: 'failed',
+          error: 'Contact has opted out of outbound messages',
         })
         failedCount++
         continue

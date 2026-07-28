@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { createClient } from '@/lib/supabase/client';
 import { useAuth } from '@/hooks/use-auth';
+import { normalizePhone } from '@/lib/whatsapp/phone-utils';
 import { Contact, MessageTemplate } from '@/types';
 
 export type CustomFieldOperator = 'is' | 'is_not' | 'contains';
@@ -103,7 +104,7 @@ export function resolveVariables(
     if (v.type === 'static') return v.value;
 
     if (v.type === 'field') {
-      const fieldMap: Record<string, string | undefined> = {
+      const fieldMap: Record<string, string | null | undefined> = {
         name: contact.name,
         phone: contact.phone,
         email: contact.email,
@@ -233,37 +234,47 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
       throw new Error('Your profile is not linked to an account.');
     }
 
-    // De-duplicate by phone within the CSV (users can paste duplicates).
+    // De-duplicate by normalized phone within the CSV (users can paste
+    // duplicates, or the same number in slightly different formats).
+    // Matching on the raw string here would miss an existing contact
+    // whose phone is stored in a different format (e.g. with/without a
+    // trunk prefix or spacing) and insert a duplicate instead — which,
+    // critically, would carry opt_out=false even if the existing
+    // contact had opted out, silently bypassing broadcast opt-out
+    // enforcement for that person.
     const uniqueByPhone = new Map<string, { phone: string; name?: string }>();
     for (const row of csvRows) {
-      if (row.phone) uniqueByPhone.set(row.phone, row);
+      const normalized = normalizePhone(row.phone);
+      if (normalized) uniqueByPhone.set(normalized, row);
     }
-    const phones = [...uniqueByPhone.keys()];
+    const normalizedPhones = [...uniqueByPhone.keys()];
 
-    // Single round-trip lookup of existing contacts by phone.
+    // Single round-trip lookup of existing contacts by normalized phone,
+    // scoped to the account (not just this user) so a contact a teammate
+    // created is found too, instead of being re-created here.
     const { data: existing, error: lookupErr } = await supabase
       .from('contacts')
       .select('*')
-      .eq('user_id', user.id)
-      .in('phone', phones);
+      .eq('account_id', accountId)
+      .in('phone_normalized', normalizedPhones);
     if (lookupErr) {
       throw new Error(`Failed to look up CSV contacts: ${lookupErr.message}`);
     }
 
     const byPhone = new Map<string, Contact>();
     for (const c of (existing ?? []) as Contact[]) {
-      if (c.phone) byPhone.set(c.phone, c);
+      if (c.phone_normalized) byPhone.set(c.phone_normalized, c);
     }
 
     // Insert only missing contacts, in one batch per 200 rows (PostgREST
     // has a default payload cap — 200 keeps individual requests small).
-    const missing = phones
+    const missing = normalizedPhones
       .filter((p) => !byPhone.has(p))
-      .map((phone) => ({
+      .map((normalized) => ({
         user_id: user.id,
         account_id: accountId,
-        phone,
-        name: uniqueByPhone.get(phone)?.name ?? null,
+        phone: uniqueByPhone.get(normalized)!.phone,
+        name: uniqueByPhone.get(normalized)?.name ?? null,
       }));
 
     const INSERT_CHUNK = 200;
@@ -277,12 +288,12 @@ export function useBroadcastSending(): UseBroadcastSendingReturn {
         throw new Error(`Failed to create CSV contacts: ${insertErr.message}`);
       }
       for (const c of (inserted ?? []) as Contact[]) {
-        if (c.phone) byPhone.set(c.phone, c);
+        if (c.phone_normalized) byPhone.set(c.phone_normalized, c);
       }
     }
 
     // Preserve input order so analytics roughly matches the CSV order.
-    return phones
+    return normalizedPhones
       .map((p) => byPhone.get(p))
       .filter((c): c is Contact => Boolean(c));
   }

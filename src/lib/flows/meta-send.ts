@@ -69,12 +69,15 @@ export async function engineSendText(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, opt_out')
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
   if (contactErr || !contact?.phone) {
     throw new Error('contact not found for this account')
+  }
+  if (contact.opt_out === true) {
+    throw new Error('contact has opted out of outbound messages')
   }
 
   const sanitized = sanitizePhoneForMeta(contact.phone)
@@ -179,12 +182,15 @@ export async function engineSendMedia(
 
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, opt_out')
     .eq('id', args.contactId)
     .eq('account_id', args.accountId)
     .maybeSingle()
   if (contactErr || !contact?.phone) {
     throw new Error('contact not found for this account')
+  }
+  if (contact.opt_out === true) {
+    throw new Error('contact has opted out of outbound messages')
   }
 
   const sanitized = sanitizePhoneForMeta(contact.phone)
@@ -331,12 +337,15 @@ async function sendInteractiveViaMeta(
   // Migration 017 moved both tables to account-scoped tenancy.
   const { data: contact, error: contactErr } = await db
     .from('contacts')
-    .select('id, phone')
+    .select('id, phone, opt_out')
     .eq('id', input.contactId)
     .eq('account_id', input.accountId)
     .maybeSingle()
   if (contactErr || !contact?.phone) {
     throw new Error('contact not found for this account')
+  }
+  if (contact.opt_out === true) {
+    throw new Error('contact has opted out of outbound messages')
   }
 
   const sanitized = sanitizePhoneForMeta(contact.phone)

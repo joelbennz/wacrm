@@ -39,7 +39,8 @@
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
     "menuSettings": "Settings",
-    "menuSignOut": "Sign out"
+    "menuSignOut": "Sign out",
+    "commandCenter": "Command Center"
   },
   "Header": {
     "dashboard": "Dashboard",
@@ -57,7 +58,8 @@
     "defaultAvatar": "Avatar",
     "menuProfile": "Profile",
     "menuSettings": "Settings",
-    "menuSignOut": "Sign out"
+    "menuSignOut": "Sign out",
+    "commandCenter": "Command Center"
   },
   "ModeToggle": {
     "switchMode": "Switch to {mode} mode"

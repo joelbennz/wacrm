@@ -10,6 +10,7 @@ import {
 
 import { getCurrentAccount } from '@/lib/auth/account';
 import { formatCurrency } from '@/lib/currency';
+import { ManualEntryPanel } from '@/components/command-center/manual-entry-panel';
 import {
   Card,
   CardContent,
@@ -128,6 +129,11 @@ export default async function CommandCenterPage() {
   const blockedSources = sources.filter(
     (s) => s.status === 'needs_credentials' || s.status === 'error'
   ).length;
+  const projectOptions = projects.map((project) => ({
+    id: project.operation_id,
+    name: project.name,
+    status: project.status,
+  }));
 
   return (
     <div className="space-y-5">
@@ -188,6 +194,8 @@ export default async function CommandCenterPage() {
           </CardHeader>
         </Card>
       </div>
+
+      <ManualEntryPanel projects={projectOptions} />
 
       <div className="grid grid-cols-1 gap-4 xl:grid-cols-3">
         <Card className="xl:col-span-2">
